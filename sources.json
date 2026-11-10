@@ -1,0 +1,7 @@
+{
+  "version": "4.13.0",
+  "rev": "333f14a34da01936f318c128d25b0b29b558822c",
+  "hash": "sha256-3QhJ6wUbcBeN2LAeL2EK3zUQvQ+kig3sS+tr+x8pbaI=",
+  "vendorHash": "sha256-GjKNE9PQIENvdnUUplqQNPvYh5zjRv0HtAvKy2bCTiE=",
+  "go": "1.27"
+}

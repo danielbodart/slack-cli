@@ -1,0 +1,142 @@
+name: Weekly update
+
+# The weekly update every danielbodart repository has, Sunday 21:23 UTC. It
+# moves every flake input (nixpkgs, on nixos-26.05). There is no mise
+# toolchain, base image or language dependency of ours to move: Nix is this
+# repository's only channel, and the Go modules the CLI is built from are
+# pinned by upstream's go.sum, which moves only with an upstream release. New
+# releases are polled hourly by upstream.yml, which is what tags and
+# releases; this releases nothing, because the CLI inside is the same version.
+#
+# nixpkgs is mostly a build tool here, but the one it supplies matters: the Go
+# compiler, whose standard library (net/http, crypto/tls, the parsers the CLI
+# feeds Slack's API responses through) is compiled into the static binary.
+# Go's security fixes land as patch releases of the compiler, so a stale lock
+# is a binary carrying a stale standard library, however current the CLI
+# version is. The binary wrapper in front of it also links nixpkgs' glibc,
+# and nix-config takes its own update two hours later, at 23:23, on the same
+# nixos-26.05, so the two usually settle on the same revision and share it.
+#
+# The moved lock is built and run on both architectures, and its packages
+# pushed to Cachix, by the same build action as CI before it lands. That
+# matters doubly here: a push made with GITHUB_TOKEN does not trigger CI, so
+# nothing else would ever build it. It lands as "Weekly update: <inputs>".
+on:
+  schedule:
+    - cron: "23 21 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Shared with upstream.yml: both commit to trunk.
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    outputs:
+      locked: ${{ steps.lock.outputs.locked }}
+      moved: ${{ steps.lock.outputs.moved }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      # The whole lock, not just nixpkgs: it is the only input, and keeping
+      # the step general means a new one is not quietly left behind.
+      - name: Update flake.lock
+        id: lock
+        run: |
+          cp flake.lock "$RUNNER_TEMP/flake.lock.before"
+          nix flake update
+
+          if git diff --quiet -- flake.lock; then
+            echo "locked=false" >>"$GITHUB_OUTPUT"
+            echo "Nothing moved." >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # The name of each input that moved, "nixpkgs, ...".
+          moved="$(jq -rn \
+            --slurpfile before "$RUNNER_TEMP/flake.lock.before" \
+            --slurpfile after flake.lock '
+              [ $after[0].nodes | to_entries[]
+                | select(.value.locked)
+                | select(.value.locked != $before[0].nodes[.key].locked)
+                | .key ]
+              | join(", ")')"
+          # Same revision, new narHash: rare, but still worth landing.
+          [ -n "$moved" ] || moved="inputs re-locked at the same revisions"
+          echo "locked=true" >>"$GITHUB_OUTPUT"
+          echo "moved=$moved" >>"$GITHUB_OUTPUT"
+          echo "Weekly update: $moved" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the candidate flake.lock
+        if: steps.lock.outputs.locked == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lock
+          path: flake.lock
+          retention-days: 1
+
+  # The gate, and the Cachix push of the package outputs: the build action
+  # pushes them once they have built and run.
+  verify:
+    needs: update
+    if: needs.update.outputs.locked == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lock
+
+      - uses: ./.github/actions/build
+        with:
+          system: ${{ matrix.system }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  commit:
+    needs: [update, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lock
+
+      - name: Commit and push
+        env:
+          MOVED: ${{ needs.update.outputs.moved }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add flake.lock
+          git commit \
+            -m "Weekly update: $MOVED" \
+            -m "Built and run on x86_64-linux and aarch64-linux, and pushed to Cachix, before landing."
+          git pull --rebase origin trunk
+          git push origin HEAD:trunk

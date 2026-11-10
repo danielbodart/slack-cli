@@ -1,0 +1,87 @@
+name: Build and smoke-test
+description: >-
+  Build slack-cli for one system, then run the result. Shared by the CI
+  workflow and by the verification stages of the Upstream and Weekly update
+  workflows, so that what lands on trunk is checked exactly the way a push to
+  trunk is.
+
+inputs:
+  system:
+    description: Nix system double, used only in log output.
+    required: true
+  cachix-auth-token:
+    description: >-
+      Write token for the danielbodart Cachix cache. Optional: without one the
+      build still runs, it just is not pushed anywhere. CI passes it only on
+      trunk.
+    required: false
+    default: ""
+  github-token:
+    description: Token for Nix's GitHub API access, to avoid rate limits.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      with:
+        extra_nix_config: |
+          experimental-features = nix-command flakes
+          access-tokens = github.com=${{ inputs.github-token }}
+
+    # Pulls only: what is pushed is named below.
+    - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+      with:
+        name: danielbodart
+        authToken: ${{ inputs.cachix-auth-token }}
+        skipPush: true
+
+    # Builds the package, which runs upstream's unit tests, then checks the
+    # version, the closure and the update script.
+    - name: nix flake check
+      shell: bash
+      run: nix flake check --print-build-logs
+
+    - name: Build
+      shell: bash
+      run: nix build .#slack-cli --print-build-logs --out-link result
+
+    # The flake check already compares --version with the pin inside the
+    # sandbox. This runs it again out here, where the runner is a real
+    # machine with a real HOME, which is closer to how anyone will run it,
+    # It also checks that the help names the CLI after the binary it is
+    # installed as, and that the command this repository exists for is there.
+    - name: Run the packaged CLI
+      shell: bash
+      run: |
+        version="$(./result/bin/slack-cli --version)"
+        expected="Using slack-cli v$(jq -r .version sources.json)"
+        echo "slack-cli reported '$version' on ${{ inputs.system }}"
+        [ "$version" = "$expected" ] || {
+          echo "expected '$expected'" >&2
+          exit 1
+        }
+
+        # Captured first: grep -q stops reading at the first match, which
+        # under pipefail can fail the step with the writer's SIGPIPE.
+        help="$(./result/bin/slack-cli --help)"
+        grep -qF '$ slack-cli <command>' <<<"$help" || {
+          echo "--help does not call the CLI slack-cli" >&2
+          exit 1
+        }
+        help="$(./result/bin/slack-cli collaborator add --help)"
+        grep -qF '$ slack-cli collaborator add' <<<"$help" || {
+          echo "collaborator add is missing" >&2
+          exit 1
+        }
+
+    # The package outputs and their closures, and nothing else: not the
+    # checks' builds (the cache's 5 GB free tier).
+    - name: Push the packages to Cachix
+      if: inputs.cachix-auth-token != ''
+      shell: bash
+      run: nix build --print-out-paths .#slack-cli | cachix push danielbodart
+
+    - name: Report closure size
+      shell: bash
+      run: nix path-info --closure-size --human-readable ./result
