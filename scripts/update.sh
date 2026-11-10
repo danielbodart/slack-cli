@@ -131,8 +131,10 @@ USAGE
   # nixpkgs, only the minor does; a go.mod that wants a newer patch than
   # nixpkgs has fails the build, which is where it should fail.
   local go
+  # awk reads to the end rather than exit at the match: under pipefail, curl
+  # fails with "Failure writing output" if its reader goes away early.
   go="$(fetch "https://raw.githubusercontent.com/$OWNER/$REPO/$rev/go.mod" |
-    awk '$1 == "go" { split($2, v, "."); print v[1] "." v[2]; exit }')"
+    awk '$1 == "go" && !found { split($2, v, "."); print v[1] "." v[2]; found = 1 }')"
   [[ "$go" =~ ^[0-9]+\.[0-9]+$ ]] || die "could not read the Go version from go.mod"
   log "go $go"
 
